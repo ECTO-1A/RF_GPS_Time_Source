@@ -4,6 +4,8 @@ Firmware for an ESP32/ESP8266 controller that speaks Trimble TSIP and NMEA to a
 Mini-T GPS disciplined clock, renders status pages on a 128×64 SSD1306 OLED, and
 offers a transparent USB-to-Mini-T serial bridge for host tools.
 
+<img alt="Mini-T controller assembly" src="Build%20Images/device_open.png" width="420">
+
 ## Features
 - Rotating on-device status pages for timing, GNSS, packet counters, and alarm detail
 - Transparent bridge mode for piping TSIP/NMEA between a PC and the Mini-T
