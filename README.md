@@ -17,7 +17,9 @@ offers a transparent USB-to-Mini-T serial bridge for host tools.
 - 0.96" or 1.3" 128×64 I²C OLED display based on the SSD1306 controller
 - GNSS antenna for the Mini-T with suitable coax/feed
 - 3.3 V wiring harness for Mini-T serial (TXD/RXD/GND) and power distribution
-- USB-C/Micro-B cable and 5 V supply for the ESP development board
+- USB-C/Micro-B cable for programming and runtime control
+- 5v power supply with barrel jack 
+- Female barrel jack connector for 5v supply
 
 ## Wiring Overview
 Both the ESP board and the Mini-T speak 3.3 V logic, so connect them directly
@@ -30,7 +32,7 @@ TX=`D6`).
 | Mini-T TXD       | GPIO16 (RX2) | To ESP; driven by Mini-T |
 | Mini-T RXD       | GPIO17 (TX2) | From ESP to Mini-T |
 | Mini-T GND       | GND        | Common ground with ESP |
-| Mini-T VCC       | 3V3        | Power from ESP board (ensure current budget) |
+| Mini-T VCC       | 5V        | Power from ESP board (ensure current budget) |
 | OLED SDA         | GPIO21     | I²C data (with 4.7 kΩ pull-up if needed) |
 | OLED SCL         | GPIO22     | I²C clock |
 | OLED VCC         | 3V3        | From ESP board |
