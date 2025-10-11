@@ -1,19 +1,20 @@
-/* ESP8266/ESP32 + 128x64 OLED for Trimble Mini-T
+/* ESP32-WROOM + 128x64 OLED for Trimble Mini-T
    Bridge Mode + TSIP AB/AC + NMEA (strict echo)
-   NEW:
+   Includes:
    - ALARM DETAIL page in rotation (press '3' to jump)
    - Right-aligned "ALM!" header badge (no overlap)
+   - 2-wire BUTTON (GPIO27 to GND):
+       * Quick press  -> next screen
+       * Long press   -> toggle BRIDGE MODE
+   - 2-wire LED (GPIO25) lights when Fix = YES
 */
 
 #include <Arduino.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Wire.h>
-#if defined(ESP8266)
-  #include <SoftwareSerial.h>
-#endif
 
-// ===== Config =====
+// ===== Config (ESP32-WROOM) =====
 static const long UART_BAUD   = 9600;
 static const int  OLED_ADDR   = 0x3C;
 static const int  OLED_W      = 128;
@@ -22,15 +23,31 @@ Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
 static const unsigned long PAGE_PERIOD_MS = 5000;
 const char* BRIDGE_CMD = "BRG";
 
-#if defined(ESP8266)
-  static const int I2C_SDA = D2, I2C_SCL = D1;
-  static const int MINIT_RX_PIN = D5, MINIT_TX_PIN = D6; // RX<-MiniT TX, TX->MiniT RX
-  SoftwareSerial MiniTSerial(MINIT_RX_PIN, MINIT_TX_PIN);
-#else
-  static const int I2C_SDA = 21, I2C_SCL = 22;
-  static const int UART_RX_PIN = 16; // to Mini-T TXD
-  static const int UART_TX_PIN = 17; // to Mini-T RXD
-#endif
+// I2C pins
+static const int I2C_SDA = 21, I2C_SCL = 22;
+
+// GPS UART pins (ESP32 Serial2)
+static const int UART_RX_PIN = 16; // ESP32 RX2 <- Mini-T TXD
+static const int UART_TX_PIN = 17; // ESP32 TX2 -> Mini-T RXD
+
+// ===== User I/O (button + Fix LED) =====
+const int BTN_PIN = 27;  // Button to GND (INPUT_PULLUP)
+const int LED_PIN = 25;  // External LED + resistor to GND (active-HIGH)
+const bool LED_ACTIVE_LOW = false;
+
+// Debounce + press type thresholds
+const unsigned long BTN_DEBOUNCE_MS = 30;
+const unsigned long LONG_PRESS_MS   = 700;
+
+static bool btnStable = true;           // stable logical level (pull-up idle HIGH)
+static bool btnLastReported = true;     // last debounced read
+static unsigned long btnLastChange = 0; // last time we changed stable state
+static bool btnWasDown = false;         // track press lifecycle
+static unsigned long btnPressStart = 0; // millis at press
+
+static inline void setFixLED(bool on){
+  digitalWrite(LED_PIN, LED_ACTIVE_LOW ? !on : on);
+}
 
 // ===== State =====
 enum Page { PAGE_TIMING=0, PAGE_GNSS=1, PAGE_PACKETS=2, PAGE_ALARM=3, PAGE_MAX=4 };
@@ -111,14 +128,11 @@ static void tsipFeed(uint8_t b){
 }
 
 // ===== OLED helpers =====
-// 6px per char at text size 1 with default font. We'll right-align small labels.
 static int textWidth6px(const char* s){ int n=0; while(*s){ n++; s++; } return n*6; }
 
 static void drawHeader(const char* title, const char* rightLabel=nullptr){
   display.fillRect(0,0,128,10,SSD1306_WHITE);
-  // left title
   display.setTextColor(SSD1306_BLACK); display.setCursor(2,1); display.setTextSize(1); display.print(title);
-  // right-aligned label (e.g., "ALM!")
   if(rightLabel && rightLabel[0]){
     int w = textWidth6px(rightLabel);
     int x = 128 - 2 - w; if (x < 2) x = 2;
@@ -128,9 +142,7 @@ static void drawHeader(const char* title, const char* rightLabel=nullptr){
 }
 
 static void drawStatusLamps(){
-  // Fix lamp (top-right, below header)
   if(st.hasFix) display.fillCircle(122,6,3,SSD1306_WHITE); else display.drawCircle(122,6,3,SSD1306_WHITE);
-  // PPS lamp
   if(st.ppsGood) display.fillCircle(112,6,2,SSD1306_WHITE); else display.drawCircle(112,6,2,SSD1306_WHITE);
 }
 
@@ -199,19 +211,16 @@ static void drawPacketsPage(){
 }
 
 static void drawAlarmPage(){
-  // Always show the badge on this page
   drawHeader("ALARM DETAIL", "ALM!");
   drawStatusLamps();
   display.setTextSize(1);
 
-  // NEW Row 3: SATs + PDOP (if known)
   display.setCursor(0,14);
   display.print("SATs U/V: ");
   char satb[16]; snprintf(satb,sizeof(satb),"%u/%u", st.satsUsed, st.satsView); display.print(satb);
   display.print("  PDOP: ");
   if (!isnan(st.pdop)) display.print(st.pdop,1); else display.print("-");
 
-  // Rows 4..: each decoded alarm flag on its own line
   int y = 26;
   if(!st.minorAlarms){
     display.setCursor(0,y); display.print("No alarms.");
@@ -256,59 +265,85 @@ void setup(){
   display.setCursor(0,0); display.println("Mini-T Display"); display.display();
 
   Serial.begin(UART_BAUD);
-#if defined(ESP8266)
-  MiniTSerial.begin(UART_BAUD);
-#else
   Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-#endif
-  Serial.println("Ready. Pages 0/1/2/3. 'B' toggles BRIDGE MODE.");
+  Serial.println("Ready. Pages 0/1/2/3. 'B' toggles BRIDGE MODE. Button: short=page, long=bridge");
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  setFixLED(false); // start off
 }
 
 void loop(){
-// -------- USB controls (robust): consume all bytes and react to any 'B'/'b' or '0'..'3' --------
+// -------- USB controls --------
 static char cmdBuf[8]; static uint8_t cmdLen = 0;
 while (Serial.available()) {
   char ch = (char)Serial.read();
-  // literal toggle
   if (ch=='B' || ch=='b') { bridgeMode=!bridgeMode; Serial.println(bridgeMode?"Bridge mode: ON":"Bridge mode: OFF"); render(); continue; }
-  // collect letters for a simple word command
   if (isalpha((unsigned char)ch)) {
     if (cmdLen < sizeof(cmdBuf)-1) cmdBuf[cmdLen++] = (char)toupper(ch);
   } else if (ch=='\r' || ch=='\n' || cmdLen >= sizeof(cmdBuf)-1) {
     cmdBuf[cmdLen] = '\0';
     if (!strcmp(cmdBuf, BRIDGE_CMD)) { bridgeMode=!bridgeMode; Serial.println(bridgeMode?"Bridge mode: ON":"Bridge mode: OFF"); render(); }
-    else if (!bridgeMode && cmdLen==1 && cmdBuf[0]>='0' && cmdBuf[0]<='3') { currentPage=(Page)(cmdBuf[0]-'0'); }
+    else if (!bridgeMode && cmdLen==1 && cmdBuf[0]>='0' && cmdBuf[0]<='3') { currentPage=(Page)(cmdBuf[0]-'0'); render(); }
     cmdLen = 0;
   }
 }
 
+  // ---- Button: debounce + short/long detection ----
+  {
+    bool raw = digitalRead(BTN_PIN);
+    unsigned long now = millis();
+
+    // Debounce into btnStable
+    if (raw != btnStable && (now - btnLastChange) >= BTN_DEBOUNCE_MS) {
+      btnStable = raw;
+      btnLastChange = now;
+
+      // Edge: pressed (goes LOW)
+      if (btnStable == LOW && !btnWasDown) {
+        btnWasDown = true;
+        btnPressStart = now;
+      }
+
+      // Edge: released (goes HIGH)
+      else if (btnStable == HIGH && btnWasDown) {
+        btnWasDown = false;
+        unsigned long dur = now - btnPressStart;
+
+        if (dur >= LONG_PRESS_MS) {
+          // Long press: toggle bridge mode (from anywhere)
+          bridgeMode = !bridgeMode;
+          Serial.print("Bridge mode: "); Serial.println(bridgeMode ? "ON (long press)" : "OFF (long press)");
+          render();
+        } else {
+          // Short press: next page (only in normal mode)
+          if (!bridgeMode) {
+            currentPage = (Page)((currentPage + 1) % PAGE_MAX);
+            Serial.print("Page -> "); Serial.println((int)currentPage);
+            render();
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Update Fix LED ----
+  setFixLED(st.hasFix);
 
   // Bridge mode
   if(bridgeMode){
     while(Serial.available()){
       int b=Serial.read();
-#if defined(ESP8266)
-      MiniTSerial.write(b);
-#else
       Serial2.write(b);
-#endif
     }
-#if defined(ESP8266)
-    while(MiniTSerial.available()) Serial.write(MiniTSerial.read());
-#else
     while(Serial2.available()) Serial.write(Serial2.read());
-#endif
     static unsigned long lastBridgeDraw=0; unsigned long now=millis();
     if(now-lastBridgeDraw>500){ render(); lastBridgeDraw=now; }
     return;
   }
 
   // Normal mode
-#if defined(ESP8266)
-  Stream& gps = MiniTSerial;
-#else
   Stream& gps = Serial2;
-#endif
 
   while(gps.available()){
     int b=gps.read(); if(b<0) break; st.bytesIn++; uint8_t u=(uint8_t)b;
@@ -329,8 +364,7 @@ while (Serial.available()) {
     Serial.print("TSIP: STAT="); char sb[4]; snprintf(sb,sizeof(sb),"%02X",st.decStat); Serial.print(sb);
     Serial.print(" PPS="); Serial.print(st.ppsGood? "OK":"BAD");
     Serial.print(" ALM="); char hb[6]; snprintf(hb,sizeof(hb),"%.4X",st.minorAlarms); Serial.print(hb);
-    char out[96]; // decoded list
-    // Reuse buildAlmList via a tiny wrapper:
+    char out[96];
     out[0]='\0'; bool first=true;
     auto add=[&](const char* s){ if(!first){ strlcat(out,", ",sizeof(out)); } strlcat(out,s,sizeof(out)); first=false; };
     if(almBit(st.minorAlarms,1))  add("ANT OPEN");
